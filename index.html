@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Hand-Controlled Particle System</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Segoe UI', sans-serif; }
+        canvas { display: block; }
+        #ui-container {
+            position: absolute; top: 20px; left: 20px; z-index: 10;
+            background: rgba(20, 20, 30, 0.8); backdrop-filter: blur(10px);
+            padding: 20px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.1);
+            color: white; width: 220px; box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+        }
+        h2 { margin: 0 0 15px 0; font-size: 14px; text-transform: uppercase; letter-spacing: 2px; opacity: 0.7; }
+        .control-group { margin-bottom: 15px; }
+        label { display: block; font-size: 12px; margin-bottom: 5px; color: #aaa; }
+        .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        button {
+            background: rgba(255,255,255,0.1); border: none; color: white; padding: 8px;
+            border-radius: 6px; cursor: pointer; transition: all 0.2s; font-size: 12px;
+        }
+        button:hover { background: rgba(255,255,255,0.2); }
+        button.active { background: #4f6ef7; color: white; font-weight: bold; }
+        input[type="color"] { width: 100%; height: 30px; border: none; border-radius: 4px; cursor: pointer; background: transparent; }
+        #status { margin-top: 15px; font-size: 11px; color: #4f6ef7; font-weight: bold; }
+        #videoElement { display: none; transform: scaleX(-1); }
+        #footer-credit { position: absolute; bottom: 15px; left: 20px; z-index: 10; color: rgba(255,255,255,0.3); font-size: 11px; }
+    </style>
+</head>
+<body>
+    <div id="ui-container">
+        <h2>Particle Core</h2>
+        <div class="control-group">
+            <label>SHAPE TEMPLATE</label>
+            <div class="btn-grid">
+                <button class="shape-btn active" data-shape="heart">Heart</button>
+                <button class="shape-btn" data-shape="flower">Flower</button>
+                <button class="shape-btn" data-shape="saturn">Saturn</button>
+                <button class="shape-btn" data-shape="fireworks">Fireworks</button>
+            </div>
+        </div>
+        <div class="control-group">
+            <label>BASE COLOR</label>
+            <input type="color" id="colorPicker" value="#ff0055">
+        </div>
+        <div id="status">Initializing AI Model...</div>
+    </div>
+    <div id="footer-credit">GPU Particle Engine · TensorFlow Handpose</div>
+
+    <video id="videoElement" playsinline></video>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose"></script>
+
+    <script>
+        const PARTICLE_COUNT = 15000;
+        const CAM_Z = 12;
+
+        let handModel = null;
+        let video = document.getElementById('videoElement');
+        let statusText = document.getElementById('status');
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = CAM_Z;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        const vertexShader = `
+            uniform float uTime;
+            uniform float uExpansion;
+            uniform float uSize;
+            attribute vec3 targetPosition;
+            attribute float randomSize;
+            varying float vDistance;
+            void main() {
+                vec3 pos = targetPosition;
+                vec3 finalPos = pos * (uExpansion * 1.5 + 0.2);
+                finalPos.x += sin(uTime + pos.y) * 0.1 * uExpansion;
+                finalPos.y += cos(uTime + pos.x) * 0.1 * uExpansion;
+                vec4 mvPosition = modelViewMatrix * vec4(finalPos, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+                gl_PointSize = (uSize * randomSize * uExpansion + 2.0) * (10.0 / -mvPosition.z);
+                vDistance = length(finalPos);
+            }
+        `;
+
+        const fragmentShader = `
+            uniform vec3 uColor;
+            void main() {
+                float r = distance(gl_PointCoord, vec2(0.5, 0.5));
+                if (r > 0.5) discard;
+                float alpha = 1.0 - (r * 2.0);
+                alpha = pow(alpha, 1.5);
+                gl_FragColor = vec4(uColor, alpha);
+            }
+        `;
+
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        const targetPositions = new Float32Array(PARTICLE_COUNT * 3);
+        const randomSizes = new Float32Array(PARTICLE_COUNT);
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            randomSizes[i] = Math.random();
+            positions[i*3] = 0; positions[i*3+1] = 0; positions[i*3+2] = 0;
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('targetPosition', new THREE.BufferAttribute(targetPositions, 3));
+        geometry.setAttribute('randomSize', new THREE.BufferAttribute(randomSizes, 1));
+
+        const material = new THREE.ShaderMaterial({
+            uniforms: {
+                uTime: { value: 0 },
+                uExpansion: { value: 0.5 },
+                uSize: { value: 4.0 },
+                uColor: { value: new THREE.Color('#ff0055') }
+            },
+            vertexShader: vertexShader,
+            fragmentShader: fragmentShader,
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+
+        const particles = new THREE.Points(geometry, material);
+        scene.add(particles);
+
+        function getPointOnHeart() {
+            const r = Math.PI * 2 * Math.random();
+            const scale = 0.25 * Math.sqrt(Math.random());
+            const x = 16 * Math.pow(Math.sin(r), 3);
+            const y = 13 * Math.cos(r) - 5 * Math.cos(2*r) - 2 * Math.cos(3*r) - Math.cos(4*r);
+            const z = (Math.random() - 0.5) * 4;
+            return { x: x * scale, y: y * scale, z: z };
+        }
+
+        function getPointOnFlower() {
+            const k = 4;
+            const theta = Math.random() * Math.PI * 2;
+            const rBase = Math.cos(k * theta);
+            const r = (rBase + 0.5) * 3 * Math.random();
+            const x = r * Math.cos(theta);
+            const y = r * Math.sin(theta);
+            const z = (Math.random() - 0.5) * 2 * (1 - r/4);
+            return { x, y, z };
+        }
+
+        function getPointOnSaturn() {
+            const rand = Math.random();
+            let x, y, z;
+            if (rand > 0.3) {
+                const angle = Math.random() * Math.PI * 2;
+                const radius = 4 + Math.random() * 2.5;
+                x = Math.cos(angle) * radius;
+                z = Math.sin(angle) * radius;
+                y = (Math.random() - 0.5) * 0.2;
+            } else {
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                const r = 2.5;
+                x = r * Math.sin(phi) * Math.cos(theta);
+                y = r * Math.sin(phi) * Math.sin(theta);
+                z = r * Math.cos(phi);
+            }
+            const tilt = 0.4;
+            const y_new = y * Math.cos(tilt) - z * Math.sin(tilt);
+            const z_new = y * Math.sin(tilt) + z * Math.cos(tilt);
+            return { x, y: y_new, z: z_new };
+        }
+
+        function getPointOnFireworks() {
+            const theta = Math.random() * Math.PI * 2;
+            const phi = Math.acos(2 * Math.random() - 1);
+            const r = 6 * Math.cbrt(Math.random());
+            const x = r * Math.sin(phi) * Math.cos(theta);
+            const y = r * Math.sin(phi) * Math.sin(theta);
+            const z = r * Math.cos(phi);
+            return { x, y, z };
+        }
+
+        function updateShape(shape) {
+            const positionsArray = geometry.attributes.targetPosition.array;
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                let p;
+                if (shape === 'heart') p = getPointOnHeart();
+                else if (shape === 'flower') p = getPointOnFlower();
+                else if (shape === 'saturn') p = getPointOnSaturn();
+                else if (shape === 'fireworks') p = getPointOnFireworks();
+                positionsArray[i*3] = p.x;
+                positionsArray[i*3+1] = p.y;
+                positionsArray[i*3+2] = p.z;
+            }
+            geometry.attributes.targetPosition.needsUpdate = true;
+        }
+
+        updateShape('heart');
+
+        document.querySelectorAll('.shape-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                document.querySelectorAll('.shape-btn').forEach(b => b.classList.remove('active'));
+                e.target.classList.add('active');
+                updateShape(e.target.dataset.shape);
+            });
+        });
+
+        document.getElementById('colorPicker').addEventListener('input', (e) => {
+            material.uniforms.uColor.value.set(e.target.value);
+        });
+
+        async function setupCamera() {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: false,
+                video: { facingMode: 'user', width: 640, height: 480 }
+            });
+            video.srcObject = stream;
+            return new Promise((resolve) => {
+                video.onloadedmetadata = () => {
+                    video.play();
+                    resolve(video);
+                };
+            });
+        }
+
+        async function initAI() {
+            try {
+                await setupCamera();
+                handModel = await handpose.load();
+                statusText.innerText = "● System Active. Show hands.";
+                statusText.style.color = "#00ff88";
+                detectHands();
+            } catch (err) {
+                statusText.innerText = "Camera access denied or unavailable.";
+                console.error(err);
+            }
+        }
+
+        let handExpansion = 0.5;
+
+        async function detectHands() {
+            if (handModel && video.readyState === 4) {
+                const predictions = await handModel.estimateHands(video);
+                if (predictions.length > 0) {
+                    let totalFactor = 0;
+                    predictions.forEach(hand => {
+                        const thumbTip = hand.landmarks[4];
+                        const indexTip = hand.landmarks[8];
+                        const dist = Math.sqrt(
+                            Math.pow(thumbTip[0] - indexTip[0], 2) +
+                            Math.pow(thumbTip[1] - indexTip[1], 2)
+                        );
+                        let factor = (dist - 20) / 130;
+                        factor = Math.max(0, Math.min(1, factor));
+                        totalFactor += factor;
+                    });
+                    const targetExpansion = totalFactor / predictions.length;
+                    handExpansion += (targetExpansion - handExpansion) * 0.1;
+                }
+            }
+            material.uniforms.uExpansion.value = handExpansion;
+            requestAnimationFrame(detectHands);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = performance.now() * 0.001;
+            material.uniforms.uTime.value = time;
+            particles.rotation.y = time * 0.05;
+            particles.rotation.z = time * 0.02;
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        initAI();
+        animate();
+    </script>
+</body>
+</html>
